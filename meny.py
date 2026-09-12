@@ -9,7 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-TOKEN = "8799964859:AAFX6MswBkHq5Cp9BIg0Xb4j_VEqcuSox24"
+TOKEN = ""
 ADMIN_ID = 5692925792
 
 bot = Bot(token=TOKEN)
