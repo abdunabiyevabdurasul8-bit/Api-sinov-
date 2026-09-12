@@ -1,1666 +1,945 @@
-import asyncio
-import logging
-import sqlite3
-import uuid
-import datetime
 import os
+import logging
 import threading
-
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    CallbackQuery,
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+from telegram import (
+    Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    Message
+    ReplyKeyboardMarkup,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
 
 
-# ============================================================
-# RENDER ENVIRONMENT
-# ============================================================
+# =========================================================
+# SOZLAMALAR
+# =========================================================
 
-TOKEN = os.getenv("BOT_TOKEN", "8799964859:AAHqdOHx_K6L0Ms_VLKqeT12RDRsF0_U7jc").strip()
-
-ADMIN_ID = int(os.getenv("ADMIN_ID", "5692925792"))
-
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8799964859:AAHqdOHx_K6L0Ms_VLKqeT12RDRsF0_U7jc")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 PORT = int(os.getenv("PORT", "10000"))
 
-DB_FILE = "database.db"
+SOS_USERNAME = os.getenv("SOS_USERNAME", "@donuz1")
 
 
-if not TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN topilmadi! Render Environment Variables ga BOT_TOKEN qo'ying."
+# =========================================================
+# XIZMATLAR
+# =========================================================
+
+SERVICES = {
+    "stars": "⭐ Stars",
+    "premium": "💎 Premium",
+    "donat": "🎁 Donat",
+    "sim": "📱 SIM",
+}
+
+
+# Har bir xizmatning narxi ALOHIDA saqlanadi
+DEFAULT_PRICES = {
+    "stars": {
+        "1d": 5000,
+        "7d": 20000,
+        "30d": 38000,
+    },
+
+    "premium": {
+        "1d": 5000,
+        "7d": 20000,
+        "30d": 38000,
+    },
+
+    "donat": {
+        "1d": 5000,
+        "7d": 20000,
+        "30d": 38000,
+    },
+
+    "sim": {
+        "1d": 5000,
+        "7d": 20000,
+        "30d": 38000,
+    },
+}
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+log = logging.getLogger("DONUZ")
+
+
+# =========================================================
+# DATABASE
+# =========================================================
+
+def get_db():
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL topilmadi! Render Environment Variables "
+            "ichiga DATABASE_URL qo'ying."
+        )
+
+    return psycopg2.connect(
+        DATABASE_URL,
+        sslmode="require"
     )
 
 
-# ============================================================
-# BOT
-# ============================================================
+def db_query(sql, params=(), fetch=False, one=False):
+    connection = get_db()
 
-bot = Bot(token=TOKEN)
+    try:
+        with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute(sql, params)
 
-router = Router()
+            result = None
+
+            if fetch:
+                if one:
+                    result = cursor.fetchone()
+                else:
+                    result = cursor.fetchall()
+
+            connection.commit()
+
+            return result
+
+    finally:
+        connection.close()
 
 
-# ============================================================
-# DATABASE
-# ============================================================
+# =========================================================
+# DATABASE JADVALLARI
+# =========================================================
 
-def db_start():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+def init_database():
 
-    cursor.execute("""
+    db_query("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            joined_date TEXT,
-            balance INTEGER DEFAULT 0,
-            api_key TEXT,
-            sub_active INTEGER DEFAULT 0,
-            sub_expire TEXT
+            user_id BIGINT PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            balance BIGINT NOT NULL DEFAULT 0,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """)
 
-    try:
-        cursor.execute(
-            "ALTER TABLE users ADD COLUMN sub_active INTEGER DEFAULT 0"
-        )
-    except sqlite3.OperationalError:
-        pass
 
-    try:
-        cursor.execute(
-            "ALTER TABLE users ADD COLUMN sub_expire TEXT"
-        )
-    except sqlite3.OperationalError:
-        pass
+    # 4 ta xizmatning obunasi shu jadvalda alohida saqlanadi.
+    #
+    # Masalan:
+    #
+    # user 123
+    # stars   -> 7 kun
+    # premium -> 30 kun
+    #
+    # bir-biriga ta'sir qilmaydi.
 
-    try:
-        cursor.execute(
-            "ALTER TABLE users ADD COLUMN api_key TEXT"
-        )
-    except sqlite3.OperationalError:
-        pass
+    db_query("""
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id BIGSERIAL PRIMARY KEY,
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            amount INTEGER,
-            photo TEXT,
-            status TEXT,
-            date TEXT
+            user_id BIGINT NOT NULL,
+
+            service TEXT NOT NULL,
+
+            started_at TIMESTAMPTZ NOT NULL,
+
+            expires_at TIMESTAMPTZ NOT NULL,
+
+            source TEXT NOT NULL DEFAULT 'purchase'
         )
     """)
 
-    cursor.execute("""
+
+    # Narxlar
+    db_query("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
-            value TEXT
+            value TEXT NOT NULL
         )
     """)
 
-    cursor.execute("""
-        INSERT OR IGNORE INTO settings (key, value)
-        VALUES ('card', '')
+
+    # Buyurtmalar
+    db_query("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id BIGSERIAL PRIMARY KEY,
+
+            user_id BIGINT NOT NULL,
+
+            service TEXT NOT NULL,
+
+            plan TEXT NOT NULL,
+
+            price BIGINT NOT NULL,
+
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
     """)
 
-    conn.commit()
-    conn.close()
+
+    # To'lovlar
+    db_query("""
+        CREATE TABLE IF NOT EXISTS payments (
+            id BIGSERIAL PRIMARY KEY,
+
+            user_id BIGINT NOT NULL,
+
+            amount BIGINT NOT NULL,
+
+            status TEXT NOT NULL DEFAULT 'pending',
+
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
 
 
-db_start()
+    # Karta
+    db_query("""
+        INSERT INTO settings(key, value)
+        VALUES('card', '8600 0000 0000 0000')
+        ON CONFLICT(key) DO NOTHING
+    """)
 
 
-# ============================================================
-# STATES
-# ============================================================
+    # 4 ta xizmat narxlarini yaratish
+    for service in SERVICES:
 
-class PaymentState(StatesGroup):
-    waiting_for_amount = State()
-    waiting_for_receipt = State()
+        for plan, amount in DEFAULT_PRICES[service].items():
 
+            key = f"price_{service}_{plan}"
 
-class AdminReject(StatesGroup):
-    waiting_for_reason = State()
-
-
-class AdminBalanceState(StatesGroup):
-    waiting_for_user_id = State()
-    waiting_for_amount = State()
-
-
-class AdminCardState(StatesGroup):
-    waiting_for_new_card = State()
+            db_query("""
+                INSERT INTO settings(key, value)
+                VALUES(%s, %s)
+                ON CONFLICT(key) DO NOTHING
+            """, (
+                key,
+                str(amount)
+            ))
 
 
-# ============================================================
-# MAIN MENU
-# ============================================================
+# =========================================================
+# SETTINGS
+# =========================================================
 
-def main_menu(is_admin=False):
+def get_setting(key):
 
-    kb = [
+    row = db_query(
+        """
+        SELECT value
+        FROM settings
+        WHERE key=%s
+        """,
+        (key,),
+        fetch=True,
+        one=True
+    )
+
+    if row:
+        return row["value"]
+
+    return ""
+
+
+def set_setting(key, value):
+
+    db_query(
+        """
+        INSERT INTO settings(key, value)
+        VALUES(%s, %s)
+
+        ON CONFLICT(key)
+        DO UPDATE SET value=EXCLUDED.value
+        """,
+        (
+            key,
+            str(value)
+        )
+    )
+
+
+def get_price(service, plan):
+
+    value = get_setting(
+        f"price_{service}_{plan}"
+    )
+
+    if not value:
+        return 0
+
+    return int(value)
+
+
+# =========================================================
+# FORMAT
+# =========================================================
+
+def money(amount):
+
+    return (
+        f"{amount:,}"
+        .replace(",", " ")
+        + " so'm"
+    )
+
+
+# =========================================================
+# USER
+# =========================================================
+
+def save_user(user):
+
+    db_query("""
+        INSERT INTO users(
+            user_id,
+            username,
+            first_name
+        )
+
+        VALUES(%s, %s, %s)
+
+        ON CONFLICT(user_id)
+
+        DO UPDATE SET
+
+            username=EXCLUDED.username,
+
+            first_name=EXCLUDED.first_name,
+
+            last_seen=NOW()
+    """, (
+        user.id,
+        user.username or "",
+        user.first_name or ""
+    ))
+
+
+# =========================================================
+# FAOL OBUNA
+# =========================================================
+
+def get_active_subscription(user_id, service):
+
+    row = db_query("""
+        SELECT expires_at
+
+        FROM subscriptions
+
+        WHERE
+            user_id=%s
+
+            AND service=%s
+
+            AND expires_at > NOW()
+
+        ORDER BY expires_at DESC
+
+        LIMIT 1
+    """, (
+        user_id,
+        service
+    ),
+        fetch=True,
+        one=True
+    )
+
+    if row:
+        return row["expires_at"]
+
+    return None
+
+
+# =========================================================
+# ASOSIY MENYU
+# =========================================================
+
+def main_menu():
+
+    keyboard = [
+
         [
-            InlineKeyboardButton(
-                text="👤 Profil",
-                callback_data="profile"
-            ),
-            InlineKeyboardButton(
-                text="💳 Balansni to'ldirish",
-                callback_data="top_up"
-            )
+            "⭐ Stars",
+            "💎 Premium"
         ],
+
         [
-            InlineKeyboardButton(
-                text="🛒 Obuna sotib olish",
-                callback_data="shop"
-            ),
-            InlineKeyboardButton(
-                text="🔑 API olish",
-                callback_data="get_api"
-            )
+            "🎁 Donat",
+            "📱 SIM"
         ],
+
         [
-            InlineKeyboardButton(
-                text="⚙️ API yangilash",
-                callback_data="refresh_api"
-            )
+            "💰 Balans",
+            "➕ Balans to'ldirish"
+        ],
+
+        [
+            "📦 Obunalarim",
+            "🆘 SOS"
         ]
+
     ]
 
-    if is_admin:
-        kb.append([
+    return ReplyKeyboardMarkup(
+        keyboard,
+        resize_keyboard=True
+    )
+
+
+# =========================================================
+# XIZMAT MENYUSI
+# =========================================================
+
+def service_menu(service):
+
+    return InlineKeyboardMarkup([
+
+        [
             InlineKeyboardButton(
-                text="👑 ADMIN PANEL",
-                callback_data="admin_panel"
+                f"1 kun — {money(get_price(service, '1d'))}",
+                callback_data=f"buy:{service}:1d"
             )
-        ])
+        ],
 
-    return InlineKeyboardMarkup(inline_keyboard=kb)
+        [
+            InlineKeyboardButton(
+                f"7 kun — {money(get_price(service, '7d'))}",
+                callback_data=f"buy:{service}:7d"
+            )
+        ],
 
+        [
+            InlineKeyboardButton(
+                f"1 oy — {money(get_price(service, '30d'))}",
+                callback_data=f"buy:{service}:30d"
+            )
+        ],
 
-# ============================================================
-# ADMIN MENU
-# ============================================================
-
-def admin_menu_kb():
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="💰 Balansni +/-",
-                    callback_data="adm_balance"
-                ),
-                InlineKeyboardButton(
-                    text="💳 Karta sozlash",
-                    callback_data="adm_card"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📊 Statistika",
-                    callback_data="adm_stats"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔙 Asosiy menyu",
-                    callback_data="back_main"
-                )
-            ]
+        [
+            InlineKeyboardButton(
+                "🎁 1 kunlik bepul sinov",
+                callback_data=f"trial:{service}"
+            )
         ]
-    )
+
+    ])
 
 
-# ============================================================
+# =========================================================
 # START
-# ============================================================
+# =========================================================
 
-@router.message(Command("start"))
-async def cmd_start(message: Message):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    user_id = message.from_user.id
+    user = update.effective_user
 
-    joined_date = message.date.strftime("%Y-%m-%d")
+    save_user(user)
 
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+    await update.message.reply_text(
 
-    cursor.execute(
-        "SELECT user_id FROM users WHERE user_id = ?",
-        (user_id,)
+        "Assalomu alaykum! 👋\n\n"
+
+        "DONUZ xizmatlariga xush kelibsiz.\n\n"
+
+        "Kerakli xizmatni tanlang:",
+
+        reply_markup=main_menu()
     )
 
-    user = cursor.fetchone()
 
-    if not user:
+# =========================================================
+# XIZMATLAR
+# =========================================================
 
-        cursor.execute("""
-            INSERT INTO users (
-                user_id,
-                joined_date,
-                balance,
-                api_key,
-                sub_active,
-                sub_expire
+async def handle_service(update, context):
+
+    user = update.effective_user
+
+    save_user(user)
+
+    text = update.message.text
+
+    service_map = {
+
+        "⭐ Stars": "stars",
+
+        "💎 Premium": "premium",
+
+        "🎁 Donat": "donat",
+
+        "📱 SIM": "sim",
+
+    }
+
+    if text not in service_map:
+        return False
+
+    service = service_map[text]
+
+    expires = get_active_subscription(
+        user.id,
+        service
+    )
+
+    current_text = ""
+
+    if expires:
+
+        current_text = (
+            "\n\n⏳ Faol obuna:\n"
+            + expires.astimezone().strftime(
+                "%d.%m.%Y %H:%M"
             )
-            VALUES (?, ?, 0, '', 0, '')
-        """, (
-            user_id,
-            joined_date
-        ))
+        )
 
-        conn.commit()
+    await update.message.reply_text(
 
-    conn.close()
+        f"{SERVICES[service]}\n"
+        f"{current_text}\n\n"
+        "Obuna muddatini tanlang:",
 
-    is_admin = user_id == ADMIN_ID
-
-    await message.answer(
-        f"Assalomu alaykum, {message.from_user.first_name}!\n\n"
-        f"API xizmatlari botiga xush kelibsiz.",
-        reply_markup=main_menu(is_admin)
+        reply_markup=service_menu(service)
     )
 
+    return True
 
-# ============================================================
-# BACK MAIN
-# ============================================================
 
-@router.callback_query(F.data == "back_main")
-async def back_main(callback: CallbackQuery):
+# =========================================================
+# BALANS
+# =========================================================
 
-    is_admin = callback.from_user.id == ADMIN_ID
+async def show_balance(update):
 
-    try:
-        await callback.message.edit_text(
-            "🏠 Asosiy menyu:",
-            reply_markup=main_menu(is_admin)
-        )
-    except Exception:
-        await callback.message.answer(
-            "🏠 Asosiy menyu:",
-            reply_markup=main_menu(is_admin)
-        )
+    user = update.effective_user
 
-    await callback.answer()
-
-
-# ============================================================
-# PROFILE
-# ============================================================
-
-@router.callback_query(F.data == "profile")
-async def profile_handler(callback: CallbackQuery):
-
-    try:
-
-        user_id = callback.from_user.id
-
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            SELECT joined_date, balance, sub_active, sub_expire
-            FROM users
-            WHERE user_id = ?
-        """, (user_id,))
-
-        user = cursor.fetchone()
-
-        if not user:
-
-            date_str = datetime.datetime.now().strftime("%Y-%m-%d")
-
-            cursor.execute("""
-                INSERT INTO users (
-                    user_id,
-                    joined_date,
-                    balance,
-                    api_key,
-                    sub_active,
-                    sub_expire
-                )
-                VALUES (?, ?, 0, '', 0, '')
-            """, (
-                user_id,
-                date_str
-            ))
-
-            conn.commit()
-
-            user = (
-                date_str,
-                0,
-                0,
-                ""
-            )
-
-        conn.close()
-
-        if user[2] == 1:
-            sub_status = (
-                f"Faol ✅\n"
-                f"Tugash vaqti: {user[3]}"
-            )
-        else:
-            sub_status = "Faol emas ❌"
-
-        text = (
-            f"👤 <b>Profil ma'lumotlari</b>\n\n"
-            f"🆔 ID: <code>{user_id}</code>\n"
-            f"📅 Qo'shilgan sana: {user[0]}\n"
-            f"💰 Balans: {user[1]} so'm\n"
-            f"📦 Obuna: {sub_status}"
-        )
-
-        is_admin = user_id == ADMIN_ID
-
-        try:
-            await callback.message.edit_text(
-                text,
-                parse_mode="HTML",
-                reply_markup=main_menu(is_admin)
-            )
-        except Exception:
-            await callback.message.answer(
-                text,
-                parse_mode="HTML",
-                reply_markup=main_menu(is_admin)
-            )
-
-        await callback.answer()
-
-    except Exception as e:
-
-        logging.exception("Profil xatosi")
-
-        await callback.answer(
-            f"Xatolik: {e}",
-            show_alert=True
-        )
-
-
-# ============================================================
-# TOP UP
-# ============================================================
-
-@router.callback_query(F.data == "top_up")
-async def top_up_handler(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute(
-        "SELECT value FROM settings WHERE key = 'card'"
-    )
-
-    card_row = cursor.fetchone()
-
-    if card_row and card_row[0]:
-        card = card_row[0]
-    else:
-        card = "Karta admin tomonidan sozlanmagan"
-
-    conn.close()
-
-    await callback.message.answer(
-        f"💳 <b>To'lov uchun karta:</b>\n\n"
-        f"<code>{card}</code>\n\n"
-        f"Iltimos, qancha summa o'tkazganingizni "
-        f"raqamlarda yozib yuboring.",
-        parse_mode="HTML"
-    )
-
-    await state.set_state(
-        PaymentState.waiting_for_amount
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# PAYMENT AMOUNT
-# ============================================================
-
-@router.message(PaymentState.waiting_for_amount)
-async def process_amount(
-    message: Message,
-    state: FSMContext
-):
-
-    if not message.text or not message.text.isdigit():
-
-        await message.answer(
-            "❌ Iltimos, faqat raqamlardan iborat "
-            "summani kiriting!"
-        )
-
-        return
-
-    amount = int(message.text)
-
-    if amount <= 0:
-
-        await message.answer(
-            "❌ Summa 0 dan katta bo'lishi kerak."
-        )
-
-        return
-
-    await state.update_data(
-        amount=amount
-    )
-
-    await message.answer(
-        "📸 Endi o'tkazmani tasdiqlovchi "
-        "chek rasmini yuboring."
-    )
-
-    await state.set_state(
-        PaymentState.waiting_for_receipt
-    )
-
-
-# ============================================================
-# RECEIPT
-# ============================================================
-
-@router.message(
-    PaymentState.waiting_for_receipt,
-    F.photo
-)
-async def process_receipt(
-    message: Message,
-    state: FSMContext
-):
-
-    data = await state.get_data()
-
-    amount = data.get("amount")
-
-    if not amount:
-
-        await message.answer(
-            "❌ To'lov summasi topilmadi. "
-            "Qaytadan urinib ko'ring."
-        )
-
-        await state.clear()
-
-        return
-
-    photo_id = message.photo[-1].file_id
-
-    user_id = message.from_user.id
-
-    date = message.date.strftime(
-        "%Y-%m-%d %H:%M"
-    )
-
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        INSERT INTO payments (
-            user_id,
-            amount,
-            photo,
-            status,
-            date
-        )
-        VALUES (?, ?, ?, 'pending', ?)
-    """, (
-        user_id,
-        amount,
-        photo_id,
-        date
-    ))
-
-    payment_id = cursor.lastrowid
-
-    conn.commit()
-    conn.close()
-
-    admin_kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅ Qabul qilish",
-                    callback_data=f"accept_{payment_id}"
-                ),
-                InlineKeyboardButton(
-                    text="❌ Rad etish",
-                    callback_data=f"reject_{payment_id}"
-                )
-            ]
-        ]
-    )
-
-    await bot.send_photo(
-        ADMIN_ID,
-        photo=photo_id,
-        caption=(
-            f"🔔 <b>Yangi to'lov!</b>\n\n"
-            f"👤 Foydalanuvchi: "
-            f"<code>{user_id}</code>\n"
-            f"💰 Summa: {amount} so'm\n"
-            f"🧾 To'lov ID: {payment_id}"
-        ),
-        reply_markup=admin_kb,
-        parse_mode="HTML"
-    )
-
-    await message.answer(
-        "✅ Chekingiz adminga yuborildi.\n\n"
-        "Tasdiqlanishini kuting."
-    )
-
-    await state.clear()
-
-
-# ============================================================
-# RECEIPT ERROR
-# ============================================================
-
-@router.message(
-    PaymentState.waiting_for_receipt
-)
-async def receipt_not_photo(message: Message):
-
-    await message.answer(
-        "📸 Iltimos, o'tkazma chekini "
-        "rasm ko'rinishida yuboring."
-    )
-
-
-# ============================================================
-# ACCEPT PAYMENT
-# ============================================================
-
-@router.callback_query(
-    F.data.startswith("accept_")
-)
-async def accept_payment(
-    callback: CallbackQuery
-):
-
-    if callback.from_user.id != ADMIN_ID:
-
-        await callback.answer(
-            "❌ Siz admin emassiz!",
-            show_alert=True
-        )
-
-        return
-
-    try:
-        payment_id = int(
-            callback.data.split("_")[1]
-        )
-    except Exception:
-
-        await callback.answer(
-            "❌ Noto'g'ri to'lov ID.",
-            show_alert=True
-        )
-
-        return
-
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT user_id, amount, status
-        FROM payments
-        WHERE id = ?
-    """, (payment_id,))
-
-    payment = cursor.fetchone()
-
-    if not payment:
-
-        conn.close()
-
-        await callback.answer(
-            "❌ To'lov topilmadi.",
-            show_alert=True
-        )
-
-        return
-
-    user_id, amount, status = payment
-
-    if status != "pending":
-
-        conn.close()
-
-        await callback.answer(
-            "⚠️ Bu to'lov allaqachon ko'rib chiqilgan.",
-            show_alert=True
-        )
-
-        return
-
-    cursor.execute("""
-        UPDATE users
-        SET balance = balance + ?
-        WHERE user_id = ?
-    """, (
-        amount,
-        user_id
-    ))
-
-    cursor.execute("""
-        UPDATE payments
-        SET status = 'accepted'
-        WHERE id = ?
-    """, (payment_id,))
-
-    conn.commit()
-    conn.close()
-
-    await bot.send_message(
-        user_id,
-        f"✅ Sizning {amount} so'm to'lovingiz "
-        f"tasdiqlandi va balansingizga qo'shildi!"
-    )
-
-    try:
-
-        old_caption = callback.message.caption or ""
-
-        await callback.message.edit_caption(
-            caption=(
-                old_caption +
-                "\n\n<b>STATUS: Qabul qilindi ✅</b>"
-            ),
-            parse_mode="HTML"
-        )
-
-    except Exception:
-        pass
-
-    await callback.answer(
-        "To'lov tasdiqlandi!"
-    )
-
-
-# ============================================================
-# REJECT PAYMENT
-# ============================================================
-
-@router.callback_query(
-    F.data.startswith("reject_")
-)
-async def reject_payment(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-
-    if callback.from_user.id != ADMIN_ID:
-
-        await callback.answer(
-            "❌ Siz admin emassiz!",
-            show_alert=True
-        )
-
-        return
-
-    try:
-
-        payment_id = int(
-            callback.data.split("_")[1]
-        )
-
-    except Exception:
-
-        await callback.answer(
-            "❌ Noto'g'ri to'lov ID.",
-            show_alert=True
-        )
-
-        return
-
-    await state.update_data(
-        payment_id=payment_id
-    )
-
-    await callback.message.answer(
-        "❌ Rad etish sababini yozib yuboring:"
-    )
-
-    await state.set_state(
-        AdminReject.waiting_for_reason
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# REJECT REASON
-# ============================================================
-
-@router.message(
-    AdminReject.waiting_for_reason
-)
-async def process_reject_reason(
-    message: Message,
-    state: FSMContext
-):
-
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    data = await state.get_data()
-
-    payment_id = data.get("payment_id")
-
-    reason = (
-        message.text
-        if message.text
-        else "Sabab ko'rsatilmagan."
-    )
-
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT user_id, status
-        FROM payments
-        WHERE id = ?
-    """, (payment_id,))
-
-    payment = cursor.fetchone()
-
-    if not payment:
-
-        conn.close()
-
-        await message.answer(
-            "❌ To'lov topilmadi."
-        )
-
-        await state.clear()
-
-        return
-
-    user_id, status = payment
-
-    if status != "pending":
-
-        conn.close()
-
-        await message.answer(
-            "⚠️ Bu to'lov allaqachon ko'rib chiqilgan."
-        )
-
-        await state.clear()
-
-        return
-
-    cursor.execute("""
-        UPDATE payments
-        SET status = 'rejected'
-        WHERE id = ?
-    """, (payment_id,))
-
-    conn.commit()
-    conn.close()
-
-    await bot.send_message(
-        user_id,
-        f"❌ Sizning to'lovingiz rad etildi.\n\n"
-        f"Sabab: {reason}"
-    )
-
-    await message.answer(
-        "✅ Foydalanuvchiga rad etish sababi yuborildi."
-    )
-
-    await state.clear()
-
-
-# ============================================================
-# SHOP
-# ============================================================
-
-@router.callback_query(
-    F.data == "shop"
-)
-async def shop_handler(
-    callback: CallbackQuery
-):
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📦 1 Haftalik obuna - 10,000 so'm",
-                    callback_data="buy_sub_7"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📦 1 Oylik obuna - 30,000 so'm",
-                    callback_data="buy_sub_30"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔙 Orqaga",
-                    callback_data="back_main"
-                )
-            ]
-        ]
-    )
-
-    text = (
-        "🛒 <b>Obuna do'koniga xush kelibsiz.</b>\n\n"
-        "Obuna turini tanlang:"
-    )
-
-    try:
-
-        await callback.message.edit_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=kb
-        )
-
-    except Exception:
-
-        await callback.message.answer(
-            text,
-            parse_mode="HTML",
-            reply_markup=kb
-        )
-
-    await callback.answer()
-
-
-# ============================================================
-# BUY SUBSCRIPTION
-# ============================================================
-
-@router.callback_query(
-    F.data.startswith("buy_sub_")
-)
-async def buy_subscription(
-    callback: CallbackQuery
-):
-
-    try:
-
-        days = int(
-            callback.data.split("_")[2]
-        )
-
-        if days == 7:
-            price = 10000
-        elif days == 30:
-            price = 30000
-        else:
-
-            await callback.answer(
-                "❌ Noto'g'ri obuna.",
-                show_alert=True
-            )
-
-            return
-
-        user_id = callback.from_user.id
-
-        now = datetime.datetime.now()
-
-        expire_date = (
-            now +
-            datetime.timedelta(days=days)
-        ).strftime("%Y-%m-%d")
-
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            SELECT balance
-            FROM users
-            WHERE user_id = ?
-        """, (user_id,))
-
-        user_row = cursor.fetchone()
-
-        if not user_row:
-
-            cursor.execute("""
-                INSERT INTO users (
-                    user_id,
-                    joined_date,
-                    balance,
-                    api_key,
-                    sub_active,
-                    sub_expire
-                )
-                VALUES (?, ?, 0, '', 0, '')
-            """, (
-                user_id,
-                now.strftime("%Y-%m-%d")
-            ))
-
-            conn.commit()
-
-            balance = 0
-
-        else:
-
-            balance = user_row[0]
-
-        if balance < price:
-
-            conn.close()
-
-            await callback.answer(
-                "❌ Balansingizda yetarli mablag' yo'q!",
-                show_alert=True
-            )
-
-            return
-
-        cursor.execute("""
-            UPDATE users
-            SET
-                balance = balance - ?,
-                sub_active = 1,
-                sub_expire = ?
-            WHERE user_id = ?
-        """, (
-            price,
-            expire_date,
-            user_id
-        ))
-
-        conn.commit()
-        conn.close()
-
-        is_admin = user_id == ADMIN_ID
-
-        text = (
-            "✅ <b>Muvaffaqiyatli obuna sotib oldingiz!</b>\n\n"
-            f"📦 Muddati: {days} kun\n"
-            f"💰 Narxi: {price} so'm\n"
-            f"📅 Tugash vaqti: {expire_date}"
-        )
-
-        try:
-
-            await callback.message.edit_text(
-                text,
-                parse_mode="HTML",
-                reply_markup=main_menu(is_admin)
-            )
-
-        except Exception:
-
-            await callback.message.answer(
-                text,
-                parse_mode="HTML",
-                reply_markup=main_menu(is_admin)
-            )
-
-        await callback.answer(
-            "Tabriklaymiz!",
-            show_alert=True
-        )
-
-    except Exception as e:
-
-        logging.exception(
-            "Obuna xatosi"
-        )
-
-        await callback.answer(
-            f"Xatolik: {e}",
-            show_alert=True
-        )
-
-
-# ============================================================
-# GET API
-# ============================================================
-
-@router.callback_query(
-    F.data == "get_api"
-)
-async def get_api_handler(
-    callback: CallbackQuery
-):
-
-    user_id = callback.from_user.id
-
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT
-            api_key,
-            sub_active,
-            sub_expire
-        FROM users
-        WHERE user_id = ?
-    """, (user_id,))
-
-    user = cursor.fetchone()
-
-    if not user:
-
-        conn.close()
-
-        await callback.message.answer(
-            "❌ Profil topilmadi. /start ni bosing."
-        )
-
-        await callback.answer()
-
-        return
-
-    api_key, sub_active, sub_expire = user
-
-    if sub_active == 1 and sub_expire:
-
-        try:
-
-            expire = datetime.datetime.strptime(
-                sub_expire,
-                "%Y-%m-%d"
-            )
-
-            if datetime.datetime.now() >= expire:
-
-                cursor.execute("""
-                    UPDATE users
-                    SET sub_active = 0
-                    WHERE user_id = ?
-                """, (user_id,))
-
-                conn.commit()
-
-                sub_active = 0
-
-        except Exception:
-            pass
-
-    if sub_active == 0:
-
-        conn.close()
-
-        await callback.message.answer(
-            "⚠️ API ishlashi uchun avval "
-            "obuna sotib olishingiz kerak!"
-        )
-
-        await callback.answer()
-
-        return
-
-    if not api_key:
-
-        api_key = str(uuid.uuid4())
-
-        cursor.execute("""
-            UPDATE users
-            SET api_key = ?
-            WHERE user_id = ?
-        """, (
-            api_key,
-            user_id
-        ))
-
-        conn.commit()
-
-    conn.close()
-
-    await callback.message.answer(
-        f"🔑 <b>Sizning API kalitingiz:</b>\n\n"
-        f"<code>{api_key}</code>\n\n"
-        f"📡 API xizmatlari faol.",
-        parse_mode="HTML"
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# REFRESH API
-# ============================================================
-
-@router.callback_query(
-    F.data == "refresh_api"
-)
-async def refresh_api_handler(
-    callback: CallbackQuery
-):
-
-    user_id = callback.from_user.id
-
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT
-            sub_active,
-            sub_expire
-        FROM users
-        WHERE user_id = ?
-    """, (user_id,))
-
-    sub = cursor.fetchone()
-
-    if not sub:
-
-        conn.close()
-
-        await callback.message.answer(
-            "❌ Profil topilmadi."
-        )
-
-        await callback.answer()
-
-        return
-
-    sub_active, sub_expire = sub
-
-    if sub_active == 1 and sub_expire:
-
-        try:
-
-            expire = datetime.datetime.strptime(
-                sub_expire,
-                "%Y-%m-%d"
-            )
-
-            if datetime.datetime.now() >= expire:
-
-                cursor.execute("""
-                    UPDATE users
-                    SET sub_active = 0
-                    WHERE user_id = ?
-                """, (user_id,))
-
-                conn.commit()
-
-                sub_active = 0
-
-        except Exception:
-            pass
-
-    if sub_active == 0:
-
-        conn.close()
-
-        await callback.message.answer(
-            "⚠️ API yangilash uchun "
-            "obunangiz faol bo'lishi kerak!"
-        )
-
-        await callback.answer()
-
-        return
-
-    new_api_key = str(uuid.uuid4())
-
-    cursor.execute("""
-        UPDATE users
-        SET api_key = ?
-        WHERE user_id = ?
-    """, (
-        new_api_key,
-        user_id
-    ))
-
-    conn.commit()
-    conn.close()
-
-    await callback.message.answer(
-        f"🔄 <b>Yangi API kalit yaratildi:</b>\n\n"
-        f"<code>{new_api_key}</code>",
-        parse_mode="HTML"
-    )
-
-    await callback.answer(
-        "API yangilandi!"
-    )
-
-
-# ============================================================
-# ADMIN PANEL
-# ============================================================
-
-@router.callback_query(
-    F.data == "admin_panel"
-)
-async def admin_panel_handler(
-    callback: CallbackQuery
-):
-
-    if callback.from_user.id != ADMIN_ID:
-
-        await callback.answer(
-            "❌ Siz admin emassiz!",
-            show_alert=True
-        )
-
-        return
-
-    text = (
-        "👑 <b>ADMIN PANEL</b>\n\n"
-        "Kerakli bo'limni tanlang:"
-    )
-
-    try:
-
-        await callback.message.edit_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=admin_menu_kb()
-        )
-
-    except Exception:
-
-        await callback.message.answer(
-            text,
-            parse_mode="HTML",
-            reply_markup=admin_menu_kb()
-        )
-
-    await callback.answer()
-
-
-# ============================================================
-# ADMIN STATISTICS
-# ============================================================
-
-@router.callback_query(
-    F.data == "adm_stats"
-)
-async def adm_stats(
-    callback: CallbackQuery
-):
-
-    if callback.from_user.id != ADMIN_ID:
-
-        await callback.answer(
-            "❌ Ruxsat yo'q.",
-            show_alert=True
-        )
-
-        return
-
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute(
-        "SELECT COUNT(*) FROM users"
-    )
-
-    users_count = cursor.fetchone()[0]
-
-    cursor.execute("""
-        SELECT SUM(amount)
-        FROM payments
-        WHERE status = 'accepted'
-    """)
-
-    total_income = cursor.fetchone()[0] or 0
-
-    cursor.execute("""
-        SELECT COUNT(*)
-        FROM users
-        WHERE sub_active = 1
-    """)
-
-    active_subs = cursor.fetchone()[0]
-
-    conn.close()
-
-    text = (
-        "📊 <b>Statistika</b>\n\n"
-        f"👥 Jami foydalanuvchilar: {users_count} ta\n"
-        f"📦 Faol obunalar: {active_subs} ta\n"
-        f"💰 Jami tushgan mablag': {total_income} so'm"
-    )
-
-    try:
-
-        await callback.message.edit_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=admin_menu_kb()
-        )
-
-    except Exception:
-
-        await callback.message.answer(
-            text,
-            parse_mode="HTML",
-            reply_markup=admin_menu_kb()
-        )
-
-    await callback.answer()
-
-
-# ============================================================
-# ADMIN BALANCE
-# ============================================================
-
-@router.callback_query(
-    F.data == "adm_balance"
-)
-async def adm_balance_start(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-
-    if callback.from_user.id != ADMIN_ID:
-
-        await callback.answer(
-            "❌ Ruxsat yo'q.",
-            show_alert=True
-        )
-
-        return
-
-    await callback.message.answer(
-        "👤 Foydalanuvchining Telegram ID "
-        "raqamini kiriting:"
-    )
-
-    await state.set_state(
-        AdminBalanceState.waiting_for_user_id
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# ADMIN USER ID
-# ============================================================
-
-@router.message(
-    AdminBalanceState.waiting_for_user_id
-)
-async def adm_balance_uid(
-    message: Message,
-    state: FSMContext
-):
-
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    if not message.text or not message.text.isdigit():
-
-        await message.answer(
-            "❌ ID faqat raqamlardan iborat "
-            "bo'lishi kerak!"
-        )
-
-        return
-
-    target_id = int(message.text)
-
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT user_id
-        FROM users
-        WHERE user_id = ?
-    """, (target_id,))
-
-    exists = cursor.fetchone()
-
-    conn.close()
-
-    if not exists:
-
-        await message.answer(
-            "❌ Bu Telegram ID bilan "
-            "foydalanuvchi topilmadi."
-        )
-
-        return
-
-    await state.update_data(
-        target_id=target_id
-    )
-
-    await message.answer(
-        "💰 Qancha summa qo'shmoqchisiz?\n\n"
-        "➕ Qo'shish: <code>10000</code>\n"
-        "➖ Ayirish: <code>-5000</code>",
-        parse_mode="HTML"
-    )
-
-    await state.set_state(
-        AdminBalanceState.waiting_for_amount
-    )
-
-
-# ============================================================
-# ADMIN BALANCE FINISH
-# ============================================================
-
-@router.message(
-    AdminBalanceState.waiting_for_amount
-)
-async def adm_balance_finish(
-    message: Message,
-    state: FSMContext
-):
-
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    try:
-
-        amount = int(message.text)
-
-    except (ValueError, TypeError):
-
-        await message.answer(
-            "❌ Faqat raqam kiriting!"
-        )
-
-        return
-
-    data = await state.get_data()
-
-    target_id = data.get("target_id")
-
-    if not target_id:
-
-        await message.answer(
-            "❌ Foydalanuvchi ID topilmadi."
-        )
-
-        await state.clear()
-
-        return
-
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute("""
+    row = db_query("""
         SELECT balance
         FROM users
-        WHERE user_id = ?
-    """, (target_id,))
-
-    row = cursor.fetchone()
-
-    if not row:
-
-        conn.close()
-
-        await message.answer(
-            "❌ Foydalanuvchi topilmadi."
-        )
-
-        await state.clear()
-
-        return
-
-    old_balance = row[0]
-
-    new_balance = old_balance + amount
-
-    if new_balance < 0:
-
-        conn.close()
-
-        await message.answer(
-            "❌ Balansni manfiy qilish mumkin emas."
-        )
-
-        return
-
-    cursor.execute("""
-        UPDATE users
-        SET balance = ?
-        WHERE user_id = ?
-    """, (
-        new_balance,
-        target_id
-    ))
-
-    conn.commit()
-    conn.close()
-
-    await message.answer(
-        f"✅ <b>Balans o'zgartirildi!</b>\n\n"
-        f"👤 ID: <code>{target_id}</code>\n"
-        f"💰 Eski balans: {old_balance} so'm\n"
-        f"🔄 O'zgarish: {amount} so'm\n"
-        f"💵 Yangi balans: {new_balance} so'm",
-        parse_mode="HTML"
+        WHERE user_id=%s
+    """,
+        (user.id,),
+        fetch=True,
+        one=True
     )
 
-    try:
+    balance = row["balance"] if row else 0
 
-        await bot.send_message(
-            target_id,
-            f"💰 Balansingiz admin tomonidan "
-            f"o'zgartirildi.\n\n"
-            f"🔄 O'zgarish: {amount} so'm\n"
-            f"💵 Yangi balans: {new_balance} so'm"
-        )
+    await update.message.reply_text(
 
-    except Exception:
-        pass
+        "💰 Sizning balansingiz:\n\n"
 
-    await state.clear()
-
-
-# ============================================================
-# ADMIN CARD
-# ============================================================
-
-@router.callback_query(
-    F.data == "adm_card"
-)
-async def adm_card_start(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-
-    if callback.from_user.id != ADMIN_ID:
-
-        await callback.answer(
-            "❌ Ruxsat yo'q.",
-            show_alert=True
-        )
-
-        return
-
-    await callback.message.answer(
-        "💳 Yangi karta raqamini kiriting.\n\n"
-        "Masalan:\n"
-        "<code>9860 1234 5678 9012</code>",
-        parse_mode="HTML"
+        f"{money(balance)}"
     )
 
-    await state.set_state(
-        AdminCardState.waiting_for_new_card
+
+# =========================================================
+# OBUNALARIM
+# =========================================================
+
+async def show_subscriptions(update):
+
+    user = update.effective_user
+
+    rows = db_query("""
+        SELECT
+            service,
+            expires_at
+
+        FROM subscriptions
+
+        WHERE
+            user_id=%s
+
+            AND expires_at > NOW()
+
+        ORDER BY expires_at
+    """,
+        (user.id,),
+        fetch=True
     )
 
-    await callback.answer()
+    if not rows:
 
-
-# ============================================================
-# SAVE CARD
-# ============================================================
-
-@router.message(
-    AdminCardState.waiting_for_new_card
-)
-async def adm_card_finish(
-    message: Message,
-    state: FSMContext
-):
-
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    new_card = (message.text or "").strip()
-
-    if not new_card:
-
-        await message.answer(
-            "❌ Karta raqamini kiriting."
+        await update.message.reply_text(
+            "📦 Sizda hozircha faol obuna yo'q."
         )
 
         return
 
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
 
-    cursor.execute("""
-        INSERT INTO settings (key, value)
-        VALUES ('card', ?)
-        ON CONFLICT(key)
-        DO UPDATE SET value = excluded.value
-    """, (
-        new_card,
-    ))
+    text = "📦 Faol obunalaringiz:\n\n"
 
-    conn.commit()
-    conn.close()
+    for row in rows:
 
-    await message.answer(
-        f"✅ Karta raqami muvaffaqiyatli o'zgartirildi:\n\n"
-        f"<code>{new_card}</code>",
-        parse_mode="HTML"
+        service_name = SERVICES.get(
+            row["service"],
+            row["service"]
+        )
+
+        expires = row["expires_at"].astimezone().strftime(
+            "%d.%m.%Y %H:%M"
+        )
+
+        text += (
+            f"{service_name}\n"
+            f"⏳ {expires}\n\n"
+        )
+
+
+    await update.message.reply_text(text)
+
+
+# =========================================================
+# SOS
+# =========================================================
+
+async def show_sos(update):
+
+    await update.message.reply_text(
+
+        "🆘 Yordam kerakmi?\n\n"
+
+        f"Admin: {SOS_USERNAME}"
     )
 
-    await state.clear()
+
+# =========================================================
+# CALLBACK
+# =========================================================
+
+async def callbacks(update, context):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    user = query.from_user
+
+    save_user(user)
+
+    data = query.data
 
 
-# ============================================================
-# RENDER WEB SERVICE HEALTH SERVER
-# ============================================================
+    # =====================================================
+    # SINOV
+    # =====================================================
+
+    if data.startswith("trial:"):
+
+        service = data.split(":")[1]
+
+        # Shu xizmat uchun oldin sinov ishlatilganmi?
+        used = db_query("""
+            SELECT id
+
+            FROM subscriptions
+
+            WHERE
+                user_id=%s
+
+                AND service=%s
+
+                AND source='trial'
+
+            LIMIT 1
+        """,
+            (
+                user.id,
+                service
+            ),
+            fetch=True,
+            one=True
+        )
+
+
+        if used:
+
+            await query.message.reply_text(
+
+                "❌ Bu xizmat uchun 1 kunlik "
+                "bepul sinovdan oldin foydalanilgansiz."
+            )
+
+            return
+
+
+        now = datetime.now(timezone.utc)
+
+        expires = now + timedelta(days=1)
+
+
+        db_query("""
+            INSERT INTO subscriptions(
+                user_id,
+                service,
+                started_at,
+                expires_at,
+                source
+            )
+
+            VALUES(%s, %s, %s, %s, 'trial')
+        """,
+            (
+                user.id,
+                service,
+                now,
+                expires
+            )
+        )
+
+
+        await query.message.reply_text(
+
+            f"🎁 {SERVICES[service]}\n\n"
+
+            "1 kunlik bepul sinov faollashtirildi! ✅\n\n"
+
+            f"⏳ Tugaydi: "
+            f"{expires.astimezone().strftime('%d.%m.%Y %H:%M')}"
+        )
+
+        return
+
+
+    # =====================================================
+    # SOTIB OLISH
+    # =====================================================
+
+    if data.startswith("buy:"):
+
+        _, service, plan = data.split(":")
+
+        amount = get_price(
+            service,
+            plan
+        )
+
+        if plan == "1d":
+            days = 1
+
+        elif plan == "7d":
+            days = 7
+
+        elif plan == "30d":
+            days = 30
+
+        else:
+            await query.message.reply_text(
+                "❌ Noma'lum tarif."
+            )
+
+            return
+
+
+        row = db_query("""
+            SELECT balance
+
+            FROM users
+
+            WHERE user_id=%s
+        """,
+            (user.id,),
+            fetch=True,
+            one=True
+        )
+
+        balance = row["balance"] if row else 0
+
+
+        if balance < amount:
+
+            await query.message.reply_text(
+
+                "❌ Balansingiz yetarli emas.\n\n"
+
+                f"Kerak: {money(amount)}\n"
+
+                f"Mavjud: {money(balance)}"
+            )
+
+            return
+
+
+        now = datetime.now(timezone.utc)
+
+        old_expire = get_active_subscription(
+            user.id,
+            service
+        )
+
+
+        if old_expire and old_expire > now:
+
+            start = old_expire
+
+        else:
+
+            start = now
+
+
+        expires = start + timedelta(days=days)
+
+
+        # Faqat shu xizmat uchun balansdan yechiladi
+        db_query("""
+            UPDATE users
+
+            SET balance = balance - %s
+
+            WHERE user_id=%s
+        """,
+            (
+                amount,
+                user.id
+            )
+        )
+
+
+        # Faqat shu xizmatga obuna yoziladi
+        db_query("""
+            INSERT INTO subscriptions(
+                user_id,
+                service,
+                started_at,
+                expires_at,
+                source
+            )
+
+            VALUES(
+                %s,
+                %s,
+                %s,
+                %s,
+                'purchase'
+            )
+        """,
+            (
+                user.id,
+                service,
+                start,
+                expires
+            )
+        )
+
+
+        # Buyurtma
+        db_query("""
+            INSERT INTO orders(
+                user_id,
+                service,
+                plan,
+                price
+            )
+
+            VALUES(
+                %s,
+                %s,
+                %s,
+                %s
+            )
+        """,
+            (
+                user.id,
+                service,
+                plan,
+                amount
+            )
+        )
+
+
+        await query.message.reply_text(
+
+            "✅ Obuna muvaffaqiyatli faollashtirildi!\n\n"
+
+            f"{SERVICES[service]}\n"
+
+            f"📅 Muddat: {days} kun\n"
+
+            f"💰 To'lov: {money(amount)}\n\n"
+
+            f"⏳ Tugaydi: "
+            f"{expires.astimezone().strftime('%d.%m.%Y %H:%M')}"
+        )
+
+        return
+
+
+# =========================================================
+# MATN HANDLER
+# =========================================================
+
+async def messages(update, context):
+
+    text = update.message.text
+
+    if await handle_service(update, context):
+
+        return
+
+
+    if text == "💰 Balans":
+
+        await show_balance(update)
+
+        return
+
+
+    if text == "📦 Obunalarim":
+
+        await show_subscriptions(update)
+
+        return
+
+
+    if text == "🆘 SOS":
+
+        await show_sos(update)
+
+        return
+
+
+    if text == "➕ Balans to'ldirish":
+
+        card = get_setting("card")
+
+        await update.message.reply_text(
+
+            "💳 Balans to'ldirish\n\n"
+
+            f"Karta: {card}\n\n"
+
+            "To'lov qilgandan keyin chekni yuboring."
+        )
+
+        return
+
+
+# =========================================================
+# RENDER HEALTH SERVER
+# =========================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
+
+        body = b"DONUZ BOT OK"
 
         self.send_response(200)
 
@@ -1669,74 +948,111 @@ class HealthHandler(BaseHTTPRequestHandler):
             "text/plain; charset=utf-8"
         )
 
-        self.end_headers()
-
-        self.wfile.write(
-            b"API BOT ISHLAYAPTI"
+        self.send_header(
+            "Content-Length",
+            str(len(body))
         )
 
-    def log_message(self, format, *args):
-        pass
+        self.end_headers()
+
+        self.wfile.write(body)
 
 
-def start_health_server():
+    def log_message(self, *args):
+
+        return
+
+
+def run_web_server():
 
     server = HTTPServer(
         ("0.0.0.0", PORT),
         HealthHandler
     )
 
-    logging.info(
-        f"Render health server {PORT} portda ishga tushdi."
-    )
-
     server.serve_forever()
 
 
-# ============================================================
+# =========================================================
 # MAIN
-# ============================================================
+# =========================================================
 
-async def main():
+def main():
 
-    health_thread = threading.Thread(
-        target=start_health_server,
+    if not BOT_TOKEN:
+
+        raise RuntimeError(
+            "BOT_TOKEN topilmadi."
+        )
+
+
+    if not ADMIN_ID:
+
+        raise RuntimeError(
+            "ADMIN_ID topilmadi."
+        )
+
+
+    if not DATABASE_URL:
+
+        raise RuntimeError(
+            "DATABASE_URL topilmadi."
+        )
+
+
+    # Database
+    init_database()
+
+
+    # Render Web Service health server
+    threading.Thread(
+        target=run_web_server,
         daemon=True
+    ).start()
+
+
+    # Telegram bot
+    application = (
+        Application
+        .builder()
+        .token(BOT_TOKEN)
+        .build()
     )
 
-    health_thread.start()
 
-    dp = Dispatcher()
-
-    dp.include_router(router)
-
-    logging.info(
-        "Telegram bot ishga tushmoqda..."
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
-    await bot.delete_webhook(
+
+    application.add_handler(
+        CallbackQueryHandler(
+            callbacks
+        )
+    )
+
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            messages
+        )
+    )
+
+
+    print("==============================")
+    print("DONUZ BOT ISHGA TUSHDI")
+    print("==============================")
+
+
+    application.run_polling(
         drop_pending_updates=True
     )
 
-    await dp.start_polling(bot)
-
-
-# ============================================================
-# RUN
-# ============================================================
 
 if __name__ == "__main__":
 
-    logging.basicConfig(
-        level=logging.INFO
-    )
-
-    try:
-
-        asyncio.run(main())
-
-    except KeyboardInterrupt:
-
-        logging.info(
-            "Bot to'xtatildi."
-        )
+    main()
