@@ -24,7 +24,7 @@ from aiogram.types import (
 # RENDER ENVIRONMENT
 # ============================================================
 
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TOKEN = os.getenv("BOT_TOKEN", "8799964859:AAHqdOHx_K6L0Ms_VLKqeT12RDRsF0_U7jc").strip()
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "5692925792"))
 
