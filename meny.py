@@ -27,7 +27,7 @@ from telegram.ext import (
 # SOZLAMALAR
 # =========================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8799964859:AAHqdOHx_K6L0Ms_VLKqeT12RDRsF0_U7jc")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 PORT = int(os.getenv("PORT", "10000"))
