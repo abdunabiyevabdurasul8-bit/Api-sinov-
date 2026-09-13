@@ -2997,17 +2997,46 @@ def main():
             "DATABASE_URL Render Environment Variables ichida yo'q."
         )
 
-    # Database
-    init_db()
+    # =====================================================
+    # DATABASE
+    # =====================================================
 
-    # Web server
-    start_health_server()
+    init_database()
 
-    # Telegram bot
+    # payments jadvaliga admin_id qo'shish
+    db_query("""
+        ALTER TABLE payments
+        ADD COLUMN IF NOT EXISTS admin_id BIGINT
+    """)
+
+    # =====================================================
+    # WEB / HEALTH SERVER
+    # =====================================================
+
+    threading.Thread(
+        target=run_web_server,
+        daemon=True
+    ).start()
+
+    # =====================================================
+    # TELEGRAM BOT
+    # =====================================================
+
     application = (
         Application.builder()
         .token(BOT_TOKEN)
         .build()
+    )
+
+    # =====================================================
+    # START
+    # =====================================================
+
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
     # =====================================================
@@ -3022,13 +3051,24 @@ def main():
     )
 
     # =====================================================
-    # ADMIN CALLBACKLAR
+    # ADMIN + PAYMENT CALLBACKLAR
     # =====================================================
 
     application.add_handler(
         CallbackQueryHandler(
             admin_all_callbacks,
             pattern=r"^(admin_|payment_)"
+        )
+    )
+
+    # =====================================================
+    # STARS / PREMIUM / DONAT / SIM CALLBACKLAR
+    # =====================================================
+
+    application.add_handler(
+        CallbackQueryHandler(
+            callbacks,
+            pattern=r"^(buy:|trial:)"
         )
     )
 
@@ -3044,7 +3084,7 @@ def main():
     )
 
     # =====================================================
-    # UMUMIY MATN
+    # UMUMIY MATNLAR
     # =====================================================
 
     application.add_handler(
@@ -3055,20 +3095,16 @@ def main():
     )
 
     # =====================================================
-    # BOTNI ISHLATISH
+    # LOG
     # =====================================================
 
-    logging.info(
-        "================================"
-    )
+    logging.info("================================")
+    logging.info("DONUZ BOT ISHGA TUSHDI")
+    logging.info("================================")
 
-    logging.info(
-        "DONUZ BOT ISHGA TUSHDI"
-    )
-
-    logging.info(
-        "================================"
-    )
+    # =====================================================
+    # BOTNI ISHGA TUSHIRISH
+    # =====================================================
 
     application.run_polling(
         drop_pending_updates=True
@@ -3080,6 +3116,4 @@ def main():
 # =========================================================
 
 if __name__ == "__main__":
-
     main()
-    
