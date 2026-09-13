@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # ENV SETTINGS
 # =========================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8799964859:AAFr-cu7hrPeVoak_1rjCLS7KjB7HH-Ba4o")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8714076700:AAGsZw_YepqBwy1KfEBAZDRnnWXEKfZ-hpQ")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 PORT = int(os.getenv("PORT", "10000"))
